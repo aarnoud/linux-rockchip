@@ -842,6 +842,9 @@ static void group_free_queue(struct panthor_group *group, struct panthor_queue *
 	/* Release the last_fence we were holding, if any. */
 	dma_fence_put(queue->fence_ctx.last_fence);
 
+	/* Release the last_fence we were holding, if any. */
+	dma_fence_put(queue->fence_ctx.last_fence);
+
 	kfree(queue);
 }
 
@@ -2775,9 +2778,6 @@ static void group_sync_upd_work(struct work_struct *work)
 
 		spin_lock(&queue->fence_ctx.lock);
 		list_for_each_entry_safe(job, job_tmp, &queue->fence_ctx.in_flight_jobs, node) {
-			if (!job->call_info.size)
-				continue;
-
 			if (syncobj->seqno < job->done_fence->seqno)
 				break;
 
@@ -2862,7 +2862,7 @@ queue_run_job(struct drm_sched_job *sched_job)
 	 */
 	if (!job->call_info.size) {
 		job->done_fence = dma_fence_get(queue->fence_ctx.last_fence);
-		return job->done_fence;
+		return dma_fence_get(job->done_fence);
 	}
 
 	ret = pm_runtime_resume_and_get(ptdev->base.dev);
