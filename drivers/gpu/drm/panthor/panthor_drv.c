@@ -763,8 +763,7 @@ static int panthor_query_timestamp_info(struct panthor_device *ptdev,
 {
 	int ret;
 
-	ret = panthor_device_resume_and_get(ptdev);
-	pr_info("%s:%i ret=%d\n", __func__, __LINE__, ret);
+	ret = pm_runtime_resume_and_get(ptdev->base.dev);
 	if (ret)
 		return ret;
 
