@@ -30,6 +30,7 @@ panthor_vm_get_bo_for_va(struct panthor_vm *vm, u64 va, u64 *bo_offset);
 
 int panthor_vm_active(struct panthor_vm *vm);
 void panthor_vm_idle(struct panthor_vm *vm);
+u32 panthor_vm_page_size(struct panthor_vm *vm);
 int panthor_vm_as(struct panthor_vm *vm);
 int panthor_vm_flush_all(struct panthor_vm *vm);
 
@@ -41,7 +42,8 @@ void panthor_vm_put(struct panthor_vm *vm);
 struct panthor_vm *panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 				     u64 kernel_va_start, u64 kernel_va_size,
 				     u64 kernel_auto_va_start,
-				     u64 kernel_auto_va_size);
+				     u64 kernel_auto_va_size,
+				     u32 page_size);
 
 int panthor_vm_prepare_mapped_bos_resvs(struct drm_exec *exec,
 					struct panthor_vm *vm,
@@ -95,5 +97,9 @@ void panthor_vm_update_resvs(struct panthor_vm *vm, struct drm_exec *exec,
 
 int panthor_mmu_pt_cache_init(void);
 void panthor_mmu_pt_cache_fini(void);
+
+#ifdef CONFIG_DEBUG_FS
+void panthor_mmu_debugfs_init(struct drm_minor *minor);
+#endif
 
 #endif

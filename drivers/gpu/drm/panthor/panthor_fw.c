@@ -12,6 +12,7 @@
 #include <linux/iosys-map.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_managed.h>
@@ -91,26 +92,26 @@ enum panthor_fw_binary_entry_type {
 #define CSF_FW_BINARY_ENTRY_UPDATE					BIT(30)
 #define CSF_FW_BINARY_ENTRY_OPTIONAL					BIT(31)
 
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_RD					BIT(0)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_WR					BIT(1)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_EX					BIT(2)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_NONE			(0 << 3)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED			(1 << 3)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_UNCACHED_COHERENT	(2 << 3)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED_COHERENT		(3 << 3)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_MASK			GENMASK(4, 3)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_PROT				BIT(5)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_SHARED				BIT(30)
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_ZERO				BIT(31)
+#define CSF_FW_BINARY_IFACE_ENTRY_RD					BIT(0)
+#define CSF_FW_BINARY_IFACE_ENTRY_WR					BIT(1)
+#define CSF_FW_BINARY_IFACE_ENTRY_EX					BIT(2)
+#define CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_NONE			(0 << 3)
+#define CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_CACHED			(1 << 3)
+#define CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_UNCACHED_COHERENT		(2 << 3)
+#define CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_CACHED_COHERENT		(3 << 3)
+#define CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_MASK			GENMASK(4, 3)
+#define CSF_FW_BINARY_IFACE_ENTRY_PROT					BIT(5)
+#define CSF_FW_BINARY_IFACE_ENTRY_SHARED				BIT(30)
+#define CSF_FW_BINARY_IFACE_ENTRY_ZERO					BIT(31)
 
-#define CSF_FW_BINARY_IFACE_ENTRY_RD_SUPPORTED_FLAGS			\
-	(CSF_FW_BINARY_IFACE_ENTRY_RD_RD |				\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_WR |				\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_EX |				\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_MASK |			\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_PROT |				\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_SHARED  |				\
-	 CSF_FW_BINARY_IFACE_ENTRY_RD_ZERO)
+#define CSF_FW_BINARY_IFACE_ENTRY_SUPPORTED_FLAGS			\
+	(CSF_FW_BINARY_IFACE_ENTRY_RD |					\
+	 CSF_FW_BINARY_IFACE_ENTRY_WR |					\
+	 CSF_FW_BINARY_IFACE_ENTRY_EX |					\
+	 CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_MASK |			\
+	 CSF_FW_BINARY_IFACE_ENTRY_PROT |				\
+	 CSF_FW_BINARY_IFACE_ENTRY_SHARED  |				\
+	 CSF_FW_BINARY_IFACE_ENTRY_ZERO)
 
 /**
  * struct panthor_fw_binary_section_entry_hdr - Describes a section of FW binary
@@ -412,8 +413,12 @@ static void panthor_fw_init_section_mem(struct panthor_device *ptdev,
 	bool was_mapped = !!section->mem->kmap;
 	int ret;
 
+	pr_info("%s:%i section %llx:%llx flags %x data size %zx\n", __func__, __LINE__,
+		section->mem->va_node.start,
+		section->mem->va_node.start + section->mem->va_node.size,
+		section->flags, section->data.size);
 	if (!section->data.size &&
-	    !(section->flags & CSF_FW_BINARY_IFACE_ENTRY_RD_ZERO))
+	    !(section->flags & CSF_FW_BINARY_IFACE_ENTRY_ZERO))
 		return;
 
 	ret = panthor_kernel_bo_vmap(section->mem);
@@ -421,7 +426,7 @@ static void panthor_fw_init_section_mem(struct panthor_device *ptdev,
 		return;
 
 	memcpy(section->mem->kmap, section->data.buf, section->data.size);
-	if (section->flags & CSF_FW_BINARY_IFACE_ENTRY_RD_ZERO) {
+	if (section->flags & CSF_FW_BINARY_IFACE_ENTRY_ZERO) {
 		memset(section->mem->kmap + section->data.size, 0,
 		       panthor_kernel_bo_size(section->mem) - section->data.size);
 	}
@@ -466,7 +471,7 @@ panthor_fw_alloc_queue_iface_mem(struct panthor_device *ptdev,
 
 	ret = panthor_kernel_bo_vmap(mem);
 	if (ret) {
-		panthor_kernel_bo_destroy(panthor_fw_vm(ptdev), mem);
+		panthor_kernel_bo_destroy(mem);
 		return ERR_PTR(ret);
 	}
 
@@ -500,6 +505,7 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 					 struct panthor_fw_binary_iter *iter,
 					 u32 ehdr)
 {
+	ssize_t vm_pgsz = panthor_vm_page_size(ptdev->fw->vm);
 	struct panthor_fw_binary_section_entry_hdr hdr;
 	struct panthor_fw_section *section;
 	u32 section_size;
@@ -528,27 +534,26 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 		return -EINVAL;
 	}
 
-	if ((hdr.va.start & ~PAGE_MASK) != 0 ||
-	    (hdr.va.end & ~PAGE_MASK) != 0) {
+	if (!IS_ALIGNED(hdr.va.start, vm_pgsz) || !IS_ALIGNED(hdr.va.end, vm_pgsz)) {
 		drm_err(&ptdev->base, "Firmware corrupted, virtual addresses not page aligned: 0x%x-0x%x\n",
 			hdr.va.start, hdr.va.end);
 		return -EINVAL;
 	}
 
-	if (hdr.flags & ~CSF_FW_BINARY_IFACE_ENTRY_RD_SUPPORTED_FLAGS) {
+	if (hdr.flags & ~CSF_FW_BINARY_IFACE_ENTRY_SUPPORTED_FLAGS) {
 		drm_err(&ptdev->base, "Firmware contains interface with unsupported flags (0x%x)\n",
 			hdr.flags);
 		return -EINVAL;
 	}
 
-	if (hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_PROT) {
+	if (hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_PROT) {
 		drm_warn(&ptdev->base,
 			 "Firmware protected mode entry not be supported, ignoring");
 		return 0;
 	}
 
 	if (hdr.va.start == CSF_MCU_SHARED_REGION_START &&
-	    !(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_SHARED)) {
+	    !(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_SHARED)) {
 		drm_err(&ptdev->base,
 			"Interface at 0x%llx must be shared", CSF_MCU_SHARED_REGION_START);
 		return -EINVAL;
@@ -587,26 +592,26 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 
 	section_size = hdr.va.end - hdr.va.start;
 	if (section_size) {
-		u32 cache_mode = hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_MASK;
+		u32 cache_mode = hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_MASK;
 		struct panthor_gem_object *bo;
 		u32 vm_map_flags = 0;
 		struct sg_table *sgt;
 		u64 va = hdr.va.start;
 
-		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR))
+		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_WR))
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_READONLY;
 
-		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_EX))
+		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_EX))
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC;
 
-		/* TODO: CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_*_COHERENT are mapped to
+		/* TODO: CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_*_COHERENT are mapped to
 		 * non-cacheable for now. We might want to introduce a new
 		 * IOMMU_xxx flag (or abuse IOMMU_MMIO, which maps to device
 		 * memory and is currently not used by our driver) for
 		 * AS_MEMATTR_AARCH64_SHARED memory, so we can take benefit
 		 * of IO-coherent systems.
 		 */
-		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED)
+		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_CACHE_MODE_CACHED)
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED;
 
 		section->mem = panthor_kernel_bo_create(ptdev, panthor_fw_vm(ptdev),
@@ -619,7 +624,7 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 		if (drm_WARN_ON(&ptdev->base, section->mem->va_node.start != hdr.va.start))
 			return -EINVAL;
 
-		if (section->flags & CSF_FW_BINARY_IFACE_ENTRY_RD_SHARED) {
+		if (section->flags & CSF_FW_BINARY_IFACE_ENTRY_SHARED) {
 			ret = panthor_kernel_bo_vmap(section->mem);
 			if (ret)
 				return ret;
@@ -689,7 +694,7 @@ panthor_reload_fw_sections(struct panthor_device *ptdev, bool full_reload)
 	list_for_each_entry(section, &ptdev->fw->sections, node) {
 		struct sg_table *sgt;
 
-		if (!full_reload && !(section->flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR))
+		if (!full_reload && !(section->flags & CSF_FW_BINARY_IFACE_ENTRY_WR))
 			continue;
 
 		panthor_fw_init_section_mem(ptdev, section);
@@ -1039,7 +1044,8 @@ static int panthor_fw_start(struct panthor_device *ptdev)
 
 	ptdev->fw->booted = false;
 	panthor_job_irq_resume(&ptdev->fw->irq, ~0);
-	gpu_write(ptdev, MCU_CONTROL, MCU_CONTROL_AUTO);
+	gpu_write(ptdev, MCU_CONTROL,
+		  ptdev->fast_reset ? MCU_CONTROL_AUTO : MCU_CONTROL_ENABLE);
 
 	if (!wait_event_timeout(ptdev->fw->req_waitqueue,
 				ptdev->fw->booted,
@@ -1135,7 +1141,7 @@ int panthor_fw_post_reset(struct panthor_device *ptdev)
 	 */
 	if (ptdev->fw->fast_reset) {
 		ret = panthor_fw_start(ptdev);
-		if (!ret)
+		if (!ret && 0)
 			goto out;
 
 		/* Forcibly reset the MCU and force a slow reset, so we get a
@@ -1188,14 +1194,16 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
 
 	cancel_delayed_work_sync(&ptdev->fw->watchdog.ping_work);
 
-	/* Make sure the IRQ handler can be called after that point. */
-	if (ptdev->fw->irq.irq)
-		panthor_job_irq_suspend(&ptdev->fw->irq);
+	if (!IS_ENABLED(CONFIG_PM) || pm_runtime_active(ptdev->base.dev)) {
+		/* Make sure the IRQ handler can be called after that point. */
+		if (ptdev->fw->irq.irq)
+			panthor_job_irq_suspend(&ptdev->fw->irq);
 
-	panthor_fw_stop(ptdev);
+		panthor_fw_stop(ptdev);
+	}
 
 	list_for_each_entry(section, &ptdev->fw->sections, node)
-		panthor_kernel_bo_destroy(panthor_fw_vm(ptdev), section->mem);
+		panthor_kernel_bo_destroy(section->mem);
 
 	/* We intentionally don't call panthor_vm_idle() and let
 	 * panthor_mmu_unplug() release the AS we acquired with
@@ -1203,8 +1211,10 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
 	 * state to keep the active_refcnt balanced.
 	 */
 	panthor_vm_put(ptdev->fw->vm);
+	ptdev->fw->vm = NULL;
 
-	panthor_gpu_power_off(ptdev, L2, ptdev->gpu_info.l2_present, 20000);
+	if (!IS_ENABLED(CONFIG_PM) || pm_runtime_active(ptdev->base.dev))
+		panthor_gpu_power_off(ptdev, L2, ptdev->gpu_info.l2_present, 20000);
 }
 
 /**
@@ -1390,7 +1400,8 @@ int panthor_fw_init(struct panthor_device *ptdev)
 	fw->vm = panthor_vm_create(ptdev, true,
 				   0, SZ_4G,
 				   CSF_MCU_SHARED_REGION_START,
-				   CSF_MCU_SHARED_REGION_SIZE);
+				   CSF_MCU_SHARED_REGION_SIZE,
+				   SZ_4K);
 	if (IS_ERR(fw->vm)) {
 		ret = PTR_ERR(fw->vm);
 		fw->vm = NULL;

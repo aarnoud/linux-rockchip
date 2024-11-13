@@ -2,6 +2,7 @@
 /* Copyright 2019 Linaro, Ltd, Rob Herring <robh@kernel.org> */
 /* Copyright 2023 Collabora ltd. */
 
+#include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_exec.h>
 #include <drm/drm_gpuvm.h>
@@ -825,6 +826,14 @@ void panthor_vm_idle(struct panthor_vm *vm)
 	mutex_unlock(&ptdev->mmu->as.slots_lock);
 }
 
+u32 panthor_vm_page_size(struct panthor_vm *vm)
+{
+	const struct io_pgtable *pgt = io_pgtable_ops_to_pgtable(vm->pgtbl_ops);
+	u32 pg_shift = ffs(pgt->cfg.pgsize_bitmap) - 1;
+
+	return 1u << pg_shift;
+}
+
 static void panthor_vm_stop(struct panthor_vm *vm)
 {
 	drm_sched_stop(&vm->sched, NULL);
@@ -846,8 +855,14 @@ int panthor_vm_as(struct panthor_vm *vm)
 	return vm->as.id;
 }
 
-static size_t get_pgsize(u64 addr, size_t size, size_t *count)
+static size_t get_pgsize(struct panthor_vm *vm, u64 addr, size_t size,
+			 size_t *count)
 {
+	u32 vm_pgsz = panthor_vm_page_size(vm);
+
+	if (vm_pgsz > SZ_4K)
+		return vm_pgsz;
+
 	/*
 	 * io-pgtable only operates on multiple pages within a single table
 	 * entry, so we need to split at boundaries of the table size, i.e.
@@ -906,7 +921,7 @@ static int panthor_vm_unmap_pages(struct panthor_vm *vm, u64 iova, u64 size)
 
 	while (offset < size) {
 		size_t unmapped_sz = 0, pgcount;
-		size_t pgsize = get_pgsize(iova + offset, size - offset, &pgcount);
+		size_t pgsize = get_pgsize(vm, iova + offset, size - offset, &pgcount);
 
 		unmapped_sz = ops->unmap_pages(ops, iova + offset, pgsize, pgcount, NULL);
 
@@ -957,7 +972,7 @@ panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 
 		while (len) {
 			size_t pgcount, mapped = 0;
-			size_t pgsize = get_pgsize(iova | paddr, len, &pgcount);
+			size_t pgsize = get_pgsize(vm, iova | paddr, len, &pgcount);
 
 			ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot,
 					     GFP_KERNEL, &mapped);
@@ -1024,12 +1039,13 @@ int
 panthor_vm_alloc_va(struct panthor_vm *vm, u64 va, u64 size,
 		    struct drm_mm_node *va_node)
 {
+	ssize_t vm_pgsz = panthor_vm_page_size(vm);
 	int ret;
 
-	if (!size || (size & ~PAGE_MASK))
+	if (!size || !IS_ALIGNED(size, vm_pgsz))
 		return -EINVAL;
 
-	if (va != PANTHOR_VM_KERNEL_AUTO_VA && (va & ~PAGE_MASK))
+	if (va != PANTHOR_VM_KERNEL_AUTO_VA && !IS_ALIGNED(va, vm_pgsz))
 		return -EINVAL;
 
 	mutex_lock(&vm->mm_lock);
@@ -1500,7 +1516,8 @@ int panthor_vm_pool_create_vm(struct panthor_device *ptdev,
 		return ret;
 
 	vm = panthor_vm_create(ptdev, false, kernel_va_start, kernel_va_range,
-			       kernel_va_start, kernel_va_range);
+			       kernel_va_start, kernel_va_range,
+			       PAGE_SIZE >= SZ_64K ? SZ_64K : SZ_4K);
 	if (IS_ERR(vm))
 		return PTR_ERR(vm);
 
@@ -2241,13 +2258,15 @@ static const struct drm_sched_backend_ops panthor_vm_bind_ops = {
  * @kernel_va_size: Size of the range reserved for kernel BO mapping.
  * @auto_kernel_va_start: Start of the auto-VA kernel range.
  * @auto_kernel_va_size: Size of the auto-VA kernel range.
+ * @page_size: Page size.
  *
  * Return: A valid pointer on success, an ERR_PTR() otherwise.
  */
 struct panthor_vm *
 panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 		  u64 kernel_va_start, u64 kernel_va_size,
-		  u64 auto_kernel_va_start, u64 auto_kernel_va_size)
+		  u64 auto_kernel_va_start, u64 auto_kernel_va_size,
+		  u32 page_size)
 {
 	u32 va_bits = GPU_MMU_FEATURES_VA_BITS(ptdev->gpu_info.mmu_features);
 	u32 pa_bits = GPU_MMU_FEATURES_PA_BITS(ptdev->gpu_info.mmu_features);
@@ -2258,6 +2277,10 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 	u64 mair, min_va, va_range;
 	struct panthor_vm *vm;
 	int ret;
+
+	/* Only 4k and 64k pages are supported. */
+	if (drm_WARN_ON(&ptdev->base, page_size != SZ_4K && page_size != SZ_64K))
+		return ERR_PTR(-EINVAL);
 
 	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
 	if (!vm)
@@ -2295,7 +2318,7 @@ panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 	refcount_set(&vm->as.active_cnt, 0);
 
 	pgtbl_cfg = (struct io_pgtable_cfg) {
-		.pgsize_bitmap	= SZ_4K | SZ_2M,
+		.pgsize_bitmap	= page_size == SZ_4K ? SZ_4K | SZ_2M : SZ_64K,
 		.ias		= va_bits,
 		.oas		= pa_bits,
 		.coherent_walk	= ptdev->coherent,
@@ -2365,11 +2388,12 @@ panthor_vm_bind_prepare_op_ctx(struct drm_file *file,
 			       const struct drm_panthor_vm_bind_op *op,
 			       struct panthor_vm_op_ctx *op_ctx)
 {
+	ssize_t vm_pgsz = panthor_vm_page_size(vm);
 	struct drm_gem_object *gem;
 	int ret;
 
 	/* Aligned on page size. */
-	if ((op->va | op->size) & ~PAGE_MASK)
+	if (!IS_ALIGNED(op->va | op->size, vm_pgsz))
 		return -EINVAL;
 
 	switch (op->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) {
@@ -2650,7 +2674,8 @@ int panthor_vm_prepare_mapped_bos_resvs(struct drm_exec *exec, struct panthor_vm
  */
 void panthor_mmu_unplug(struct panthor_device *ptdev)
 {
-	panthor_mmu_irq_suspend(&ptdev->mmu->irq);
+	if (!IS_ENABLED(CONFIG_PM) || pm_runtime_active(ptdev->base.dev))
+		panthor_mmu_irq_suspend(&ptdev->mmu->irq);
 
 	mutex_lock(&ptdev->mmu->as.slots_lock);
 	for (u32 i = 0; i < ARRAY_SIZE(ptdev->mmu->as.slots); i++) {
@@ -2722,6 +2747,56 @@ int panthor_mmu_init(struct panthor_device *ptdev)
 
 	return drmm_add_action_or_reset(&ptdev->base, panthor_mmu_release_wq, mmu->vm.wq);
 }
+
+#ifdef CONFIG_DEBUG_FS
+static int show_vm_gpuvas(struct panthor_vm *vm, struct seq_file *m)
+{
+	int ret;
+
+	mutex_lock(&vm->op_lock);
+	ret = drm_debugfs_gpuva_info(m, &vm->base);
+	mutex_unlock(&vm->op_lock);
+
+	return ret;
+}
+
+static int show_each_vm(struct seq_file *m, void *arg)
+{
+	struct drm_info_node *node = (struct drm_info_node *)m->private;
+	struct drm_device *ddev = node->minor->dev;
+	struct panthor_device *ptdev = container_of(ddev, struct panthor_device, base);
+	int (*show)(struct panthor_vm *, struct seq_file *) = node->info_ent->data;
+	struct panthor_vm *vm;
+	int ret = 0;
+
+	mutex_lock(&ptdev->mmu->vm.lock);
+	list_for_each_entry(vm, &ptdev->mmu->vm.list, node) {
+		ret = show(vm, m);
+		if (ret < 0)
+			break;
+
+		seq_puts(m, "\n");
+	}
+	mutex_unlock(&ptdev->mmu->vm.lock);
+
+	return ret;
+}
+
+static struct drm_info_list panthor_mmu_debugfs_list[] = {
+	DRM_DEBUGFS_GPUVA_INFO(show_each_vm, show_vm_gpuvas),
+};
+
+/**
+ * panthor_mmu_debugfs_init() - Initialize MMU debugfs entries
+ * @minor: Minor.
+ */
+void panthor_mmu_debugfs_init(struct drm_minor *minor)
+{
+	drm_debugfs_create_files(panthor_mmu_debugfs_list,
+				 ARRAY_SIZE(panthor_mmu_debugfs_list),
+				 minor->debugfs_root, minor);
+}
+#endif /* CONFIG_DEBUG_FS */
 
 /**
  * panthor_mmu_pt_cache_init() - Initialize the page table cache.

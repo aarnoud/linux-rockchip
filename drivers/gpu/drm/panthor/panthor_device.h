@@ -9,6 +9,7 @@
 #include <linux/atomic.h>
 #include <linux/io-pgtable.h>
 #include <linux/regulator/consumer.h>
+#include <linux/pm_runtime.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 
@@ -64,6 +65,25 @@ struct panthor_irq {
 
 	/** @suspended: Set to true when the IRQ is suspended. */
 	atomic_t suspended;
+};
+
+/**
+ * enum panthor_device_profiling_mode - Profiling state
+ */
+enum panthor_device_profiling_flags {
+	/** @PANTHOR_DEVICE_PROFILING_DISABLED: Profiling is disabled. */
+	PANTHOR_DEVICE_PROFILING_DISABLED = 0,
+
+	/** @PANTHOR_DEVICE_PROFILING_CYCLES: Sampling job cycles. */
+	PANTHOR_DEVICE_PROFILING_CYCLES = BIT(0),
+
+	/** @PANTHOR_DEVICE_PROFILING_TIMESTAMP: Sampling job timestamp. */
+	PANTHOR_DEVICE_PROFILING_TIMESTAMP = BIT(1),
+
+	/** @PANTHOR_DEVICE_PROFILING_ALL: Sampling everything. */
+	PANTHOR_DEVICE_PROFILING_ALL =
+	PANTHOR_DEVICE_PROFILING_CYCLES |
+	PANTHOR_DEVICE_PROFILING_TIMESTAMP,
 };
 
 /**
@@ -161,7 +181,24 @@ struct panthor_device {
 		 * is suspended.
 		 */
 		struct page *dummy_latest_flush;
+
+		/** @recovery_needed: True when a resume attempt failed. */
+		atomic_t recovery_needed;
 	} pm;
+
+	/** @profile_mask: User-set profiling flags for job accounting. */
+	u32 profile_mask;
+
+	/** @current_frequency: Device clock frequency at present. Set by DVFS*/
+	unsigned long current_frequency;
+
+	/** @fast_rate: Maximum device clock frequency. Set by DVFS */
+	unsigned long fast_rate;
+};
+
+struct panthor_gpu_usage {
+	u64 time;
+	u64 cycles;
 };
 
 /**
@@ -176,6 +213,9 @@ struct panthor_file {
 
 	/** @groups: Scheduling group pool attached to this file. */
 	struct panthor_group_pool *groups;
+
+	/** @stats: cycle and timestamp measures for job execution. */
+	struct panthor_gpu_usage stats;
 };
 
 int panthor_device_init(struct panthor_device *ptdev);
@@ -207,6 +247,19 @@ int panthor_device_mmap_io(struct panthor_device *ptdev,
 int panthor_device_resume(struct device *dev);
 int panthor_device_suspend(struct device *dev);
 
+static inline int panthor_device_resume_and_get(struct panthor_device *ptdev)
+{
+	int ret = pm_runtime_resume_and_get(ptdev->base.dev);
+
+	/* If the resume failed, we need to clear the runtime_error, which we
+	 * can done by forcing the RPM state to suspended.
+	 */
+	if (ret && atomic_cmpxchg(&ptdev->pm.recovery_needed, 1, 0) == 1)
+		pm_runtime_set_suspended(ptdev->base.dev);
+
+	return ret;
+}
+
 enum drm_panthor_exception_type {
 	DRM_PANTHOR_EXCEPTION_OK = 0x00,
 	DRM_PANTHOR_EXCEPTION_TERMINATED = 0x04,
@@ -216,6 +269,7 @@ enum drm_panthor_exception_type {
 	DRM_PANTHOR_EXCEPTION_CS_RES_TERM = 0x0f,
 	DRM_PANTHOR_EXCEPTION_MAX_NON_FAULT = 0x3f,
 	DRM_PANTHOR_EXCEPTION_CS_CONFIG_FAULT = 0x40,
+	DRM_PANTHOR_EXCEPTION_CS_UNRECOVERABLE = 0x41,
 	DRM_PANTHOR_EXCEPTION_CS_ENDPOINT_FAULT = 0x44,
 	DRM_PANTHOR_EXCEPTION_CS_BUS_FAULT = 0x48,
 	DRM_PANTHOR_EXCEPTION_CS_INSTR_INVALID = 0x49,
